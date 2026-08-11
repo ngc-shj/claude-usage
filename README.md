@@ -10,6 +10,9 @@ Two writers append to one JSONL log, `~/.claude/usage-log.jsonl`:
 | `bin/statusline-usage.sh` | Claude Code's status line. Renders the model and both percentages, and records whatever the session payload carried. |
 | `bin/claude-usage-poll.sh` | A background poller. Reads the same figures from the internal OAuth usage endpoint every five minutes, without sending a model prompt. |
 
+`bin/usage-query.sh` reads it back, and `skills/usage-log/` teaches Claude Code
+to use that rather than subtract two lines by hand.
+
 They share one lock, one monotonic frontier, one privacy policy and one record
 format, because the poller feeds its response through the status line script
 rather than writing the log itself.
@@ -17,7 +20,7 @@ rather than writing the log itself.
 ## Install
 
 ```bash
-bash install.sh                        # -> ~/.claude/usage/
+bash install.sh                        # -> ~/.claude/usage/ and ~/.claude/skills/
 bash scripts/install-usage-poller.sh   # systemd (Linux) or launchd (macOS)
 tail -f ~/.claude/usage-log.jsonl
 ```
@@ -38,6 +41,34 @@ that manages `hooks/` as its own source of truth (such as
 top-level scripts there that it does not ship, so a copy placed alongside its
 hooks would vanish on its next run. That statusLine string is the only thing
 tying the two repos together.
+
+`skills/` is different: installers there replace the skill directories they
+ship and sweep nothing, so both repos can populate `~/.claude/skills/` without
+either deleting the other's. This one installs `usage-log/`.
+
+## Querying the log
+
+```bash
+bash ~/.claude/usage/usage-query.sh now
+bash ~/.claude/usage/usage-query.sh diff --from -90m
+bash ~/.claude/usage/usage-query.sh history -n 20
+```
+
+`--from`/`--to` accept an ISO 8601 instant, an epoch, or an offset back from
+now (`-90m`, `-6h`, `-2d`). The value in force at an instant is the last
+reading at or before it, judged per window.
+
+Refusing a subtraction is what this is for. `diff` prints no number when the
+window rolled over inside the span, when there is no reading to subtract from,
+or when the window is `null` at an end — cases where the difference would look
+entirely reasonable and mean nothing. `now` marks a reading STALE when the
+window it describes has already ended, which is the only sense in which an old
+line is a problem: the log appends on change, so an old timestamp otherwise
+just means the figure has not moved.
+
+The `usage-log` skill installed alongside it points Claude Code at this tool
+and carries the same rules, so an assistant asked "how much is left?" or "what
+did that batch cost?" reads the log instead of guessing.
 
 ## What a record means
 

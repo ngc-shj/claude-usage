@@ -10,14 +10,46 @@ setup() {
 
 mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
-@test "installs both scripts executable under ~/.claude/usage" {
+@test "installs every script in bin/ executable under ~/.claude/usage" {
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
 
-  for name in statusline-usage.sh claude-usage-poll.sh; do
-    cmp -s "$REPO_ROOT/bin/$name" "$TEST_HOME/.claude/usage/$name"
+  for source_file in "$REPO_ROOT"/bin/*.sh; do
+    name="$(basename "$source_file")"
+    cmp -s "$source_file" "$TEST_HOME/.claude/usage/$name"
     [ -x "$TEST_HOME/.claude/usage/$name" ]
   done
+}
+
+@test "installs the skill tree into ~/.claude/skills" {
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Installed skill: usage-log"* ]]
+  cmp -s "$REPO_ROOT/skills/usage-log/SKILL.md" \
+    "$TEST_HOME/.claude/skills/usage-log/SKILL.md"
+}
+
+@test "a skill this repo does not ship is left alone" {
+  # ~/.claude/skills is a namespace another installer writes into. Sweeping it
+  # for entries missing from this repo would delete that installer's skills.
+  mkdir -p "$TEST_HOME/.claude/skills/someone-elses"
+  printf 'not ours\n' > "$TEST_HOME/.claude/skills/someone-elses/SKILL.md"
+
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_HOME/.claude/skills/someone-elses/SKILL.md" ]
+  run cat "$TEST_HOME/.claude/skills/someone-elses/SKILL.md"
+  [ "$output" = "not ours" ]
+}
+
+@test "a reinstall replaces a stale file inside the skill directory" {
+  bash "$SCRIPT" >/dev/null
+  printf 'stale\n' > "$TEST_HOME/.claude/skills/usage-log/leftover.md"
+
+  bash "$SCRIPT" >/dev/null
+  [ ! -e "$TEST_HOME/.claude/skills/usage-log/leftover.md" ]
+  cmp -s "$REPO_ROOT/skills/usage-log/SKILL.md" \
+    "$TEST_HOME/.claude/skills/usage-log/SKILL.md"
 }
 
 @test "the installed poller matches what the scheduler installer demands" {

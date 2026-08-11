@@ -51,6 +51,20 @@ for source_file in "$SCRIPT_DIR"/bin/*.sh; do
   echo "  Installed $name"
 done
 
+# Skills are directory trees under a namespace another installer also writes
+# into. Only the directories this repo ships are replaced — no sweep for stale
+# entries, because everything else under skills/ belongs to somebody else.
+if [ -d "$SCRIPT_DIR/skills" ]; then
+  mkdir -p "$HOME/.claude/skills"
+  for skill_dir in "$SCRIPT_DIR"/skills/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_name="$(basename "$skill_dir")"
+    rm -rf "$HOME/.claude/skills/$skill_name"
+    cp -r "${skill_dir%/}" "$HOME/.claude/skills/"
+    echo "  Installed skill: $skill_name"
+  done
+fi
+
 for legacy_name in statusline-usage.sh claude-usage-poll.sh; do
   if [ -e "$LEGACY/$legacy_name" ]; then
     echo "  NOTE: superseded copy still at $LEGACY/$legacy_name — it is now" \
