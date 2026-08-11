@@ -1,0 +1,8 @@
+.DS_Store
+*.bak
+*.swp
+*~
+
+# Project-local Claude Code config auto-created per machine/session. Holds
+# absolute host paths and session permission grants — never shareable.
+.claude/
