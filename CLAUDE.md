@@ -9,7 +9,11 @@ unit file under `systemd/` or `launchd/` changed.
 | Edit here | Lands at |
 | --- | --- |
 | `bin/*.sh` | `~/.claude/usage/` |
+| `skills/*/` | `~/.claude/skills/` |
 | `systemd/`, `launchd/` | `~/.config/systemd/user/`, `~/Library/LaunchAgents/` |
+
+`~/.claude/skills/` is shared with other installers. Replace only the
+directories this repo ships; never sweep that tree for unknown entries.
 
 `scripts/install-usage-poller.sh` refuses to schedule a poller that differs from
 `bin/claude-usage-poll.sh`, so run `install.sh` first.
