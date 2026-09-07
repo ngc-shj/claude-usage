@@ -168,7 +168,7 @@ esac
 # The observed endpoint uses UTC ISO timestamps with fractional seconds. Keep
 # conversion deliberately narrow: an unrecognised future shape is an error,
 # never a guessed reset boundary.
-payload="$(jq -ce '
+reading="$(jq -re '
   def percent:
     tonumber
     | if . >= 0 and . <= 100 then .
@@ -180,20 +180,60 @@ payload="$(jq -ce '
        | sub("\\+00:00$"; "Z") | fromdateiso8601)
     else error("invalid resets_at") end
     | if . > 0 then . else error("invalid resets_at") end;
-  def window($w):
-    if ($w | type) == "object"
-       and $w.utilization != null and $w.resets_at != null then
-      {used_percentage: ($w.utilization | percent),
-       resets_at: ($w.resets_at | epoch)}
+  def measure($utilization; $resets_at):
+    if $utilization != null and $resets_at != null then
+      {used_percentage: ($utilization | percent), resets_at: ($resets_at | epoch)}
     else null end;
-  {model:{display_name:"usage-poller"},
-   rate_limits:{five_hour: window(.five_hour), seven_day: window(.seven_day)}}
-  | select(.rate_limits.five_hour != null or .rate_limits.seven_day != null)
+  # limits[] labels each entry with a kind, so it still carries the numbers
+  # after a rename of the top-level window key. It is read only once that key
+  # is gone: a key that is present and null is the endpoint stating the window
+  # does not exist, and that answer is taken at face value.
+  def from_limits($kind):
+    ([.limits[]? | select(type == "object" and .kind == $kind)] | first) as $entry
+    | if $entry == null then null
+      else measure($entry.percent; $entry.resets_at) end;
+  def window($key; $kind):
+    if has($key) then
+      .[$key] as $w
+      | if ($w | type) == "object" then measure($w.utilization; $w.resets_at)
+        else null end
+    else from_limits($kind) end;
+  # A window that cannot be read is not a window that is not there. The first is
+  # a schema change and has to be loud; the second is an ordinary idle period.
+  def understood($key):
+    if has($key) then
+      .[$key] as $w
+      | $w == null
+        or (($w | type) == "object"
+            and ($w | has("utilization")) and ($w | has("resets_at")))
+    else (.limits | type) == "array" end;
+  {five_hour: window("five_hour"; "session"),
+   seven_day: window("seven_day"; "weekly_all")} as $rate_limits
+  | (if $rate_limits.five_hour != null or $rate_limits.seven_day != null then "record"
+     elif understood("five_hour") and understood("seven_day") then "idle"
+     else "unknown" end) as $verdict
+  | [$verdict,
+     ({model: {display_name: "usage-poller"}, rate_limits: $rate_limits} | tojson)]
+  | @tsv
 ' "$tmp_body" 2>/dev/null)" || {
   warn "unexpected usage response schema"
   exit 1
 }
-[ -n "$payload" ] || { warn "usage response contained no supported window"; exit 1; }
+payload="${reading#*$'\t'}"
+
+case "${reading%%$'\t'*}" in
+  record) ;;
+  idle)
+    # Between an expired five-hour window and the next request there is simply
+    # nothing to record. Having nothing to say must not look like a fault, or
+    # the timer spends every idle stretch parked in a failed state.
+    exit 0
+    ;;
+  *)
+    warn "usage response has no recognised rate-limit fields"
+    exit 1
+    ;;
+esac
 
 status_output="$(printf '%s\n' "$payload" | bash "$STATUSLINE")" || {
   warn "statusline logger failed"

@@ -113,7 +113,72 @@ JSON
   run bash "$SCRIPT"
 
   [ "$status" -ne 0 ]
-  [[ "$output" == *"unexpected usage response schema"* ]]
+  [[ "$output" == *"no recognised rate-limit fields"* ]]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+# The endpoint nulls a window whenever it does not currently exist -- five of
+# the six seven_day_* siblings are null on a healthy response. An idle stretch
+# is not a fault, and must not park the timer in a failed state for hours.
+@test "windows the endpoint reports as absent record nothing and do not fail" {
+  export CURL_STUB_BODY='{"five_hour":null,"seven_day":null,"limits":[]}'
+  run bash "$SCRIPT"
+
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+@test "a response carrying no rate-limit fields at all is reported" {
+  export CURL_STUB_BODY='{"spend":{"percent":0}}'
+  run bash "$SCRIPT"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no recognised rate-limit fields"* ]]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+# A window whose key survives but whose fields were renamed is a schema change,
+# not an idle period. Told apart by the field names, not by the values.
+@test "a window object missing the fields we read is not mistaken for an idle one" {
+  export CURL_STUB_BODY='{"five_hour":{"percent":12.5,"resets_at":"2026-08-08T21:00:00Z"},"seven_day":null}'
+  run bash "$SCRIPT"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no recognised rate-limit fields"* ]]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+@test "a renamed top-level window key falls back to the limits array" {
+  export CURL_STUB_BODY='{
+    "session_window":{"utilization":12.5,"resets_at":"2026-08-08T21:00:00Z"},
+    "limits":[
+      {"kind":"session","percent":12.5,"resets_at":"2026-08-08T21:00:00.997589+00:00"},
+      {"kind":"weekly_all","percent":34,"resets_at":"2026-08-15T10:59:59.997613+00:00"},
+      {"kind":"weekly_scoped","percent":0,"resets_at":null}
+    ]}'
+  run bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+
+  run jq -e '
+    .five_hour.used_percentage == 12.5
+    and .five_hour.resets_at == ("2026-08-08T21:00:00Z" | fromdateiso8601)
+    and .seven_day.used_percentage == 34
+    and .seven_day.resets_at == ("2026-08-15T10:59:59Z" | fromdateiso8601)
+  ' "$CLAUDE_USAGE_LOG"
+  [ "$status" -eq 0 ]
+}
+
+# A present-but-null key is the endpoint answering "no window", and that answer
+# is believed. Reading limits[] anyway would resurrect a window it just denied.
+@test "the limits array does not override a window the endpoint nulled" {
+  export CURL_STUB_BODY='{
+    "five_hour":null,
+    "seven_day":null,
+    "limits":[{"kind":"session","percent":12.5,"resets_at":"2026-08-08T21:00:00Z"}]}'
+  run bash "$SCRIPT"
+
+  [ "$status" -eq 0 ]
   [ ! -e "$CLAUDE_USAGE_LOG" ]
 }
 
