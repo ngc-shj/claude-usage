@@ -13,6 +13,9 @@ API_URL="${CLAUDE_USAGE_API_URL:-https://api.anthropic.com/api/oauth/usage}"
 STATUSLINE="${CLAUDE_USAGE_STATUSLINE:-$(cd "$(dirname "$0")" && pwd)/statusline-usage.sh}"
 BACKOFF_FILE="${CLAUDE_USAGE_BACKOFF_FILE:-$HOME/.claude/state/usage-poll-not-before}"
 LOCK="${CLAUDE_USAGE_POLL_LOCK:-$HOME/.claude/state/usage-poll.lock}"
+# How long an expired access token may go unrefreshed before that becomes an
+# error rather than a wait. Observed refresh gaps run to twenty minutes.
+EXPIRED_GRACE="${CLAUDE_USAGE_EXPIRED_GRACE:-3600}"
 
 warn() { printf 'claude-usage-poll: %s\n' "$*" >&2; }
 
@@ -64,6 +67,43 @@ fi
 case "$not_before" in
   ''|*[!0-9]*) ;;
   *) [ "$now_epoch" -lt "$not_before" ] && exit 0 ;;
+esac
+
+# This poller only reads the credentials; Claude Code refreshes them, and only
+# when it runs. Between an access token expiring and the next refresh the
+# endpoint answers 401 through no fault of ours, so wait that window out
+# quietly. A credential nothing is refreshing still has to be loud: a poller
+# that stays silent leaves a gap the log cannot distinguish from an idle window.
+# Both fields are epoch milliseconds; an absent or unrecognised one leaves the
+# gate open, so the request itself remains the authority on whether auth works.
+credential_epoch() {
+  jq -r --arg key "$1" '
+    .claudeAiOauth[$key] | select(type == "number") | (. / 1000 | floor) | select(. > 0)
+  ' "$CREDENTIALS" 2>/dev/null
+}
+access_expires_at="$(credential_epoch expiresAt)"
+case "$access_expires_at" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$now_epoch" -ge "$access_expires_at" ]; then
+      refresh_expires_at="$(credential_epoch refreshTokenExpiresAt)"
+      case "$refresh_expires_at" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ "$now_epoch" -ge "$refresh_expires_at" ]; then
+            warn "OAuth refresh token expired; run claude auth login"
+            exit 1
+          fi
+          ;;
+      esac
+      expired_for="$((now_epoch - access_expires_at))"
+      if [ "$expired_for" -ge "$EXPIRED_GRACE" ]; then
+        warn "OAuth access token expired ${expired_for}s ago and nothing has refreshed it; start Claude Code or run claude auth login"
+        exit 1
+      fi
+      exit 0
+    fi
+    ;;
 esac
 
 token="$(jq -er '.claudeAiOauth.accessToken | select(type == "string" and length > 0)' \

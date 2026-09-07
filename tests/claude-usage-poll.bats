@@ -56,6 +56,17 @@ SH
 
 mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
+# Offsets are seconds from now; the credentials file stores milliseconds.
+credentials_expiring_in() {
+  local now
+  now="$(date +%s)"
+  cat > "$CLAUDE_USAGE_CREDENTIALS" <<JSON
+{"claudeAiOauth":{"accessToken":"fake-oauth-token",
+                  "expiresAt":$(( (now + $1) * 1000 )),
+                  "refreshTokenExpiresAt":$(( (now + $2) * 1000 ))}}
+JSON
+}
+
 @test "poller converts the internal API response and records both windows" {
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
@@ -115,6 +126,49 @@ mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"OAuth authentication failed"* ]]
   [[ "$output" != *"fake-oauth-token"* ]]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+@test "a token expiring later is polled as usual" {
+  credentials_expiring_in 3600 604800
+  run bash "$SCRIPT"
+
+  [ "$status" -eq 0 ]
+  [ -s "$CURL_STUB_ARGS" ]
+  [ -s "$CLAUDE_USAGE_LOG" ]
+}
+
+# The 401 this avoids is indistinguishable from a real authentication failure at
+# the endpoint, so the window has to be recognised before the request goes out.
+@test "a token expired inside the refresh window is skipped without a request" {
+  credentials_expiring_in -1800 604800
+  run bash "$SCRIPT"
+
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CURL_STUB_ARGS" ]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+@test "a token nothing refreshes is reported once the window closes" {
+  credentials_expiring_in -7200 604800
+  run bash "$SCRIPT"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"nothing has refreshed it"* ]]
+  [ ! -e "$CURL_STUB_ARGS" ]
+  [ ! -e "$CLAUDE_USAGE_LOG" ]
+}
+
+# Inside the grace window, so this passes only if the refresh token is checked
+# before the quiet skip.
+@test "an expired refresh token is reported without waiting out the window" {
+  credentials_expiring_in -60 -60
+  run bash "$SCRIPT"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refresh token expired"* ]]
+  [ ! -e "$CURL_STUB_ARGS" ]
   [ ! -e "$CLAUDE_USAGE_LOG" ]
 }
 
