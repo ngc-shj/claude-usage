@@ -6,7 +6,12 @@
 setup() {
   SCRIPT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/bin/usage-query.sh"
   export CLAUDE_USAGE_LOG="$BATS_TEST_TMPDIR/usage-log.jsonl"
+  # Fixtures below are built relative to NOW, and the script is compared against
+  # it. Left to read its own clock, the script lands a second later than the
+  # fixture whenever the run crosses a second boundary, and an exact assertion
+  # like "resets in 1h0m" comes out 59m instead.
   NOW="$(date +%s)"
+  export CLAUDE_USAGE_NOW="$NOW"
 }
 
 # $1 seconds before now, $2/$3 percentages, $4/$5 reset boundaries as seconds
@@ -28,6 +33,22 @@ row() {
   [[ "$output" == *"five_hour  12% used, 88 left"* ]]
   [[ "$output" == *"seven_day  40% used, 60 left"* ]]
   [[ "$output" == *"resets in 1h0m"* ]]
+}
+
+@test "the instant every answer is relative to can be pinned" {
+  row 300 12 40 3600 604800
+  export CLAUDE_USAGE_NOW="$((NOW + 1800))"
+  run bash "$SCRIPT" now
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resets in 30m"* ]]
+}
+
+@test "an unreadable pinned instant is an error, not a silent fallback" {
+  row 300 12 40 3600 604800
+  export CLAUDE_USAGE_NOW="yesterday"
+  run bash "$SCRIPT" now
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be an epoch second"* ]]
 }
 
 @test "now calls a reading STALE when its window has already ended" {

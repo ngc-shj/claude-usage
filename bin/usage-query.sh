@@ -19,11 +19,17 @@
 set -u
 
 LOG="${CLAUDE_USAGE_LOG:-$HOME/.claude/usage-log.jsonl}"
-NOW="$(date +%s)"
+# Every answer here is relative to one instant. Reading the clock twice would
+# let a fixture and the reading it is compared against land a second apart, so
+# the instant is taken once and can be pinned from outside.
+NOW="${CLAUDE_USAGE_NOW:-$(date +%s)}"
 
 warn() { printf 'usage-query: %s\n' "$*" >&2; }
 die() { warn "$*"; exit 1; }
 
+case "$NOW" in
+  ''|*[!0-9]*) die "CLAUDE_USAGE_NOW must be an epoch second: $NOW" ;;
+esac
 command -v jq >/dev/null 2>&1 || die "jq is required"
 [ -r "$LOG" ] || die "no usage log at $LOG"
 [ -s "$LOG" ] || die "usage log is empty: $LOG"

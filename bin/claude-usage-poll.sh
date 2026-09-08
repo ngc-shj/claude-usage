@@ -13,6 +13,9 @@ API_URL="${CLAUDE_USAGE_API_URL:-https://api.anthropic.com/api/oauth/usage}"
 STATUSLINE="${CLAUDE_USAGE_STATUSLINE:-$(cd "$(dirname "$0")" && pwd)/statusline-usage.sh}"
 BACKOFF_FILE="${CLAUDE_USAGE_BACKOFF_FILE:-$HOME/.claude/state/usage-poll-not-before}"
 LOCK="${CLAUDE_USAGE_POLL_LOCK:-$HOME/.claude/state/usage-poll.lock}"
+# How long an expired access token may go unrefreshed before that becomes an
+# error rather than a wait. Observed refresh gaps run to twenty minutes.
+EXPIRED_GRACE="${CLAUDE_USAGE_EXPIRED_GRACE:-3600}"
 
 warn() { printf 'claude-usage-poll: %s\n' "$*" >&2; }
 
@@ -64,6 +67,43 @@ fi
 case "$not_before" in
   ''|*[!0-9]*) ;;
   *) [ "$now_epoch" -lt "$not_before" ] && exit 0 ;;
+esac
+
+# This poller only reads the credentials; Claude Code refreshes them, and only
+# when it runs. Between an access token expiring and the next refresh the
+# endpoint answers 401 through no fault of ours, so wait that window out
+# quietly. A credential nothing is refreshing still has to be loud: a poller
+# that stays silent leaves a gap the log cannot distinguish from an idle window.
+# Both fields are epoch milliseconds; an absent or unrecognised one leaves the
+# gate open, so the request itself remains the authority on whether auth works.
+credential_epoch() {
+  jq -r --arg key "$1" '
+    .claudeAiOauth[$key] | select(type == "number") | (. / 1000 | floor) | select(. > 0)
+  ' "$CREDENTIALS" 2>/dev/null
+}
+access_expires_at="$(credential_epoch expiresAt)"
+case "$access_expires_at" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$now_epoch" -ge "$access_expires_at" ]; then
+      refresh_expires_at="$(credential_epoch refreshTokenExpiresAt)"
+      case "$refresh_expires_at" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ "$now_epoch" -ge "$refresh_expires_at" ]; then
+            warn "OAuth refresh token expired; run claude auth login"
+            exit 1
+          fi
+          ;;
+      esac
+      expired_for="$((now_epoch - access_expires_at))"
+      if [ "$expired_for" -ge "$EXPIRED_GRACE" ]; then
+        warn "OAuth access token expired ${expired_for}s ago and nothing has refreshed it; start Claude Code or run claude auth login"
+        exit 1
+      fi
+      exit 0
+    fi
+    ;;
 esac
 
 token="$(jq -er '.claudeAiOauth.accessToken | select(type == "string" and length > 0)' \
@@ -128,7 +168,7 @@ esac
 # The observed endpoint uses UTC ISO timestamps with fractional seconds. Keep
 # conversion deliberately narrow: an unrecognised future shape is an error,
 # never a guessed reset boundary.
-payload="$(jq -ce '
+reading="$(jq -re '
   def percent:
     tonumber
     | if . >= 0 and . <= 100 then .
@@ -140,20 +180,60 @@ payload="$(jq -ce '
        | sub("\\+00:00$"; "Z") | fromdateiso8601)
     else error("invalid resets_at") end
     | if . > 0 then . else error("invalid resets_at") end;
-  def window($w):
-    if ($w | type) == "object"
-       and $w.utilization != null and $w.resets_at != null then
-      {used_percentage: ($w.utilization | percent),
-       resets_at: ($w.resets_at | epoch)}
+  def measure($utilization; $resets_at):
+    if $utilization != null and $resets_at != null then
+      {used_percentage: ($utilization | percent), resets_at: ($resets_at | epoch)}
     else null end;
-  {model:{display_name:"usage-poller"},
-   rate_limits:{five_hour: window(.five_hour), seven_day: window(.seven_day)}}
-  | select(.rate_limits.five_hour != null or .rate_limits.seven_day != null)
+  # limits[] labels each entry with a kind, so it still carries the numbers
+  # after a rename of the top-level window key. It is read only once that key
+  # is gone: a key that is present and null is the endpoint stating the window
+  # does not exist, and that answer is taken at face value.
+  def from_limits($kind):
+    ([.limits[]? | select(type == "object" and .kind == $kind)] | first) as $entry
+    | if $entry == null then null
+      else measure($entry.percent; $entry.resets_at) end;
+  def window($key; $kind):
+    if has($key) then
+      .[$key] as $w
+      | if ($w | type) == "object" then measure($w.utilization; $w.resets_at)
+        else null end
+    else from_limits($kind) end;
+  # A window that cannot be read is not a window that is not there. The first is
+  # a schema change and has to be loud; the second is an ordinary idle period.
+  def understood($key):
+    if has($key) then
+      .[$key] as $w
+      | $w == null
+        or (($w | type) == "object"
+            and ($w | has("utilization")) and ($w | has("resets_at")))
+    else (.limits | type) == "array" end;
+  {five_hour: window("five_hour"; "session"),
+   seven_day: window("seven_day"; "weekly_all")} as $rate_limits
+  | (if $rate_limits.five_hour != null or $rate_limits.seven_day != null then "record"
+     elif understood("five_hour") and understood("seven_day") then "idle"
+     else "unknown" end) as $verdict
+  | [$verdict,
+     ({model: {display_name: "usage-poller"}, rate_limits: $rate_limits} | tojson)]
+  | @tsv
 ' "$tmp_body" 2>/dev/null)" || {
   warn "unexpected usage response schema"
   exit 1
 }
-[ -n "$payload" ] || { warn "usage response contained no supported window"; exit 1; }
+payload="${reading#*$'\t'}"
+
+case "${reading%%$'\t'*}" in
+  record) ;;
+  idle)
+    # Between an expired five-hour window and the next request there is simply
+    # nothing to record. Having nothing to say must not look like a fault, or
+    # the timer spends every idle stretch parked in a failed state.
+    exit 0
+    ;;
+  *)
+    warn "usage response has no recognised rate-limit fields"
+    exit 1
+    ;;
+esac
 
 status_output="$(printf '%s\n' "$payload" | bash "$STATUSLINE")" || {
   warn "statusline logger failed"
